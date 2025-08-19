@@ -13,10 +13,19 @@ def build_message(title: str, url: str, published: str | None) -> str:
     parts.append(url)
     return "\n".join(parts)
 
+def parse_int_env(var_name: str, default: int) -> int:
+    """Safely parse integer from environment variable, fallback to default if invalid or empty."""
+    raw = os.getenv(var_name, str(default))
+    try:
+        return int(raw) if raw.strip() else default
+    except ValueError:
+        logging.warning("Invalid value for %s=%r, using default: %d", var_name, raw, default)
+        return default
+
 def main() -> int:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-    max_items_total = int(os.getenv("MAX_ITEMS_PER_RUN", "10"))
+    max_items_total = parse_int_env("MAX_ITEMS_PER_RUN", 10)
     state = StateStore()
     state.load()
     tg = TelegramClient()
