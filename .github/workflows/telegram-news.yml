@@ -1,0 +1,55 @@
+(cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF'
+diff --git a/.github/workflows/telegram-news.yml b/.github/workflows/telegram-news.yml
+--- a/.github/workflows/telegram-news.yml
++++ b/.github/workflows/telegram-news.yml
+@@ -0,0 +1,48 @@
++name: Telegram News Bot
++
++on:
++  schedule:
++    - cron: '*/15 * * * *'
++  workflow_dispatch: {}
++
++permissions:
++  contents: write
++
++jobs:
++  run:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: '3.11'
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r requirements.txt
++
++      - name: Run scraper
++        env:
++          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
++          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
++          MAX_ITEMS_PER_RUN: ${{ vars.MAX_ITEMS_PER_RUN }}
++        run: |
++          python -m src.main
++
++      - name: Commit state if changed
++        run: |
++          if [[ -n "$(git status --porcelain)" ]]; then
++            git config user.name "github-actions[bot]"
++            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++            git add data/seen.json || true
++            git commit -m "chore: update seen state [skip ci]" || true
++            git push
++          else
++            echo "No changes to commit"
++          fi
++
++
+EOF
+)
