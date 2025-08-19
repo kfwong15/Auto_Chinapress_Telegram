@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      MAX_ITEMS_PER_RUN: 10  # 默认值，避免空字符串导致崩溃
+      MAX_ITEMS_PER_RUN: 10  # 默认值，防止空字符串导致崩溃
 
     steps:
       - name: Checkout
@@ -38,13 +38,13 @@ jobs:
           python -m src.main
 
       - name: Commit state if changed
-  run: |
-    if [[ -n "$(git status --porcelain)" ]]; then
-      git config user.name "github-actions[bot]"
-      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      git add data/seen.json || true
-      git commit -m "chore: update seen state [skip ci]" || true
-      git push
-    else
-      echo "No changes to commit"
-    fi
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/seen.json || true
+            git commit -m "chore: update seen state [skip ci]" || true
+            git push
+          else
+            echo "No changes to commit"
+          fi
