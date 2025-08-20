@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import List
+import xml.etree.ElementTree as ET
 
 import feedparser
 import requests
@@ -17,6 +18,9 @@ from .models import Article
 
 RSS_URL = "https://www.chinapress.com.my/feed/"
 HOME_URL = "https://www.chinapress.com.my/"
+WP_JSON_POSTS = f"{HOME_URL.rstrip('/')}/wp-json/wp/v2/posts"
+SITEMAP_INDEX = f"{HOME_URL.rstrip('/')}/sitemap_index.xml"
+POST_SITEMAP = f"{HOME_URL.rstrip('/')}/post-sitemap.xml"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -118,9 +122,9 @@ def fetch_from_home(max_items: int = 30) -> List[Article]:
         if "chinapress.com.my" not in url:
             continue
         # Filter out navigational/category links by requiring article-like patterns
-        is_post_id = bool(re.search(r"[?&]p=\\d+", url))
-        is_yyyy_mm_dd = bool(re.search(r"/20\\d{2}/\\d{1,2}/\\d{1,2}/", url))
-        is_yyyymmdd = bool(re.search(r"/20\\d{2}\\d{2}\\d{2}/", url))
+        is_post_id = bool(re.search(r"[?&]p=\d+", url))
+        is_yyyy_mm_dd = bool(re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", url))
+        is_yyyymmdd = bool(re.search(r"/20\d{2}\d{2}\d{2}/", url))
         if not (is_post_id or is_yyyy_mm_dd or is_yyyymmdd):
             continue
         title = (a.get_text() or "").strip()
@@ -143,13 +147,28 @@ def fetch_from_home_playwright(max_items: int = 30) -> List[Article]:
     articles: List[Article] = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ])
             context = browser.new_context(
                 user_agent=DEFAULT_HEADERS["User-Agent"],
                 locale="zh-CN",
             )
             page = context.new_page()
+            # Reduce headless fingerprint
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            """)
             page.goto(HOME_URL, wait_until="load", timeout=30000)
+            try:
+                page.wait_for_selector("a[href*='?p='], a[href*='/202']", state="attached", timeout=5000)
+            except Exception:
+                page.wait_for_timeout(2000)
             # Heuristic: WordPress-style article URLs containing year/month/day
             anchors = page.query_selector_all("a[href]")
             seen_urls = set()
@@ -161,7 +180,7 @@ def fetch_from_home_playwright(max_items: int = 30) -> List[Article]:
                 if "chinapress.com.my" not in href:
                     continue
                 # Match /YYYY/MM/DD/ patterns
-                if not re.search(r"/20\\d{2}/\\d{1,2}/\\d{1,2}/", href):
+                if not re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", href):
                     continue
                 title = (a.inner_text() or "").strip()
                 if len(title) < 6:
@@ -193,6 +212,40 @@ def fetch_from_home_playwright(max_items: int = 30) -> List[Article]:
         return []
     return articles
 
+def fetch_from_wpjson(max_items: int = 30) -> List[Article]:
+    """Fetch latest posts via WordPress REST API as a robust fallback.
+
+    Many WordPress sites expose /wp-json/wp/v2/posts which returns JSON
+    including links and titles. This often bypasses homepage anti-bot markup
+    changes and yields recent posts reliably.
+    """
+    logging.info("Fetching via WP JSON: %s", WP_JSON_POSTS)
+    session = _create_session()
+    params = {
+        "per_page": min(max_items, 50),
+        "page": 1,
+        "orderby": "date",
+        "order": "desc",
+        "_fields": "link,title,excerpt,date",
+    }
+    resp = session.get(WP_JSON_POSTS, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    articles: List[Article] = []
+    for item in data:
+        link = (item.get("link") or "").strip()
+        title_html = ((item.get("title") or {}).get("rendered") or "").strip()
+        if not link or not title_html:
+            continue
+        # Strip HTML from title
+        title_text = BeautifulSoup(title_html, "html.parser").get_text().strip()
+        if not title_text:
+            continue
+        articles.append(Article(title=title_text, url=link, published_at=item.get("date"), summary=None, images=[]))
+        if len(articles) >= max_items:
+            break
+    return articles
+
 def fetch_latest(max_items: int = 50) -> List[Article]:
     try:
         rss_items = fetch_from_rss(max_items=max_items)
@@ -200,12 +253,26 @@ def fetch_latest(max_items: int = 50) -> List[Article]:
             return rss_items
     except Exception as e:
         logging.warning("RSS fetch failed: %s", e)
+    # Try sitemap-based fallback first as it is lightweight and reliable
+    try:
+        items = fetch_from_sitemap(max_items=max_items)
+        if items:
+            return items
+    except Exception as e:
+        logging.error("Sitemap fetch failed: %s", e)
     try:
         items = fetch_from_home(max_items=max_items)
         if items:
             return items
     except Exception as e:
         logging.error("Homepage fetch failed: %s", e)
+    # Next: WordPress REST API fallback
+    try:
+        items = fetch_from_wpjson(max_items=max_items)
+        if items:
+            return items
+    except Exception as e:
+        logging.error("WP JSON fetch failed: %s", e)
     # Last resort: dynamic rendering
     try:
         items = fetch_from_home_playwright(max_items=max_items)
@@ -214,3 +281,68 @@ def fetch_latest(max_items: int = 50) -> List[Article]:
     except Exception as e:
         logging.error("Homepage (Playwright) fetch failed: %s", e)
     return []
+
+def fetch_from_sitemap(max_items: int = 30) -> List[Article]:
+    """Parse WordPress sitemaps to retrieve latest posts.
+
+    Strategy:
+    1. Try post-sitemap.xml directly
+    2. If not present, parse sitemap_index.xml to find the newest post sitemap
+    """
+    logging.info("Fetching via Sitemap: %s or %s", POST_SITEMAP, SITEMAP_INDEX)
+    session = _create_session()
+
+    # Helper to parse a given sitemap URL for <url><loc> entries
+    def _parse_sitemap_urls(url: str) -> List[str]:
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        # Some servers return HTML; try to parse regardless
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError:
+            return []
+        ns_urlset = "{http://www.sitemaps.org/schemas/sitemap/0.9}url"
+        urls: List[str] = []
+        for url_node in root.findall(f".//{ns_urlset}"):
+            loc = url_node.findtext("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
+            if loc and "chinapress.com.my" in loc:
+                urls.append(loc.strip())
+        return urls
+
+    # 1) Direct post sitemap
+    urls = _parse_sitemap_urls(POST_SITEMAP)
+    if not urls:
+        # 2) sitemap index -> find post sitemaps and pick the latest
+        resp = session.get(SITEMAP_INDEX, timeout=20)
+        resp.raise_for_status()
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError:
+            root = None
+        if root is not None:
+            ns_sitemap = "{http://www.sitemaps.org/schemas/sitemap/0.9}sitemap"
+            entries = []
+            for sm in root.findall(f".//{ns_sitemap}"):
+                loc = sm.findtext("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
+                if not loc:
+                    continue
+                if "post-sitemap" in loc:
+                    entries.append(loc.strip())
+            # Try latest by lexical order
+            for loc in sorted(entries, reverse=True):
+                urls = _parse_sitemap_urls(loc)
+                if urls:
+                    break
+
+    articles: List[Article] = []
+    for u in urls[:max_items * 3]:
+        # Filter out obvious non-article pages
+        if not (re.search(r"/20\d{2}/", u) or re.search(r"[?&]p=\d+", u)):
+            continue
+        title = u.rsplit('/', 2)[-2].replace('-', ' ')
+        if not title:
+            title = u
+        articles.append(Article(title=title, url=u, published_at=None, summary=None, images=[]))
+        if len(articles) >= max_items:
+            break
+    return articles
